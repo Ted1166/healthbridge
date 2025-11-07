@@ -12,6 +12,7 @@ mod consultation_escrow {
         platform_fee_percent: u8,
         platform_wallet: AccountId,
         owner: AccountId,
+        health_registry_address: AccountId,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +40,8 @@ mod consultation_escrow {
         Disputed,     // Patient disputed the consultation
         Refunded,     // Refunded to patient
         Released,     // Payment released to doctor
+        Cancelled,
+        NoShow,
     }
 
     #[ink(event)]
@@ -82,6 +85,22 @@ mod consultation_escrow {
         amount: Balance,
     }
 
+    #[ink(event)]
+    pub struct ConsultationCancelled {
+        #[ink(topic)]
+        consultation_id: u64,
+        cancelled_by: AccountId,
+        refund_amount: Balance,
+    }
+
+    #[ink(event)]
+    pub struct NoShowReported {
+        #[ink(topic)]
+        consultation_id: u64,
+        #[ink(topic)]
+        doctor: AccountId,
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     pub enum Error {
@@ -93,25 +112,37 @@ mod consultation_escrow {
         DisputeWindowExpired,
         TooEarlyToRelease,
         OverflowError,
+        DoctorNotVerified,
+        SlotNotAvailable,
+        CancellationNotAllowed,
     }
 
     pub type Result<T> = core::result::Result<T, Error>;
 
     impl Default for ConsultationEscrow {
         fn default() -> Self {
-            Self::new(AccountId::from([0x0; 32]), 3)
+            Self::new(
+                AccountId::from([0x0; 32]),
+                3,
+                AccountId::from([0x0; 32])
+            )
         }
     }
 
     impl ConsultationEscrow {
         #[ink(constructor)]
-        pub fn new(platform_wallet: AccountId, platform_fee_percent: u8) -> Self {
+        pub fn new(
+            platform_wallet: AccountId, 
+            platform_fee_percent: u8, 
+            health_registry_address: AccountId,
+        ) -> Self {
             Self {
                 next_id: 1,
                 consultations: Mapping::default(),
                 platform_fee_percent,
                 platform_wallet,
                 owner: Self::env().caller(),
+                health_registry_address,
             }
         }
 
@@ -354,6 +385,124 @@ mod consultation_escrow {
             self.platform_fee_percent = new_fee_percent;
             Ok(())
         }
+
+        /// Cancel consultation with refund policy
+        #[ink(message)]
+        pub fn cancel_consultation(&mut self, consultation_id: u64) -> Result<()> {
+            let caller = self.env().caller();
+            let mut consultation = self.consultations
+                .get(consultation_id)
+                .ok_or(Error::ConsultationNotFound)?;
+
+            // Only patient or doctor can cancel
+            if consultation.patient != caller && consultation.doctor != caller {
+                return Err(Error::Unauthorized);
+            }
+
+            // Can only cancel if Pending
+            if consultation.status != ConsultationStatus::Pending {
+                return Err(Error::CancellationNotAllowed);
+            }
+
+            // Check timing for refund policy
+            let current_time = self.env().block_timestamp();
+            let time_until_consultation = consultation.scheduled_time
+                .checked_sub(current_time)
+                .unwrap_or(0);
+
+            // Refund policy: 
+            // >24h before: 100% refund
+            // <24h before: 50% refund (rest goes to doctor as cancellation fee)
+            let refund_amount = if time_until_consultation > 24 * 60 * 60 * 1000 {
+                consultation.amount
+            } else {
+                consultation.amount
+                    .checked_div(2)
+                    .ok_or(Error::OverflowError)?
+            };
+
+            // Transfer refund to patient
+            if self.env().transfer(consultation.patient, refund_amount).is_err() {
+                return Err(Error::TransferFailed);
+            }
+
+            // If less than 100% refund, send remainder to doctor
+            if refund_amount < consultation.amount {
+                let doctor_compensation = consultation.amount
+                    .checked_sub(refund_amount)
+                    .ok_or(Error::OverflowError)?;
+                if self.env().transfer(consultation.doctor, doctor_compensation).is_err() {
+                    return Err(Error::TransferFailed);
+                }
+            }
+
+            consultation.status = ConsultationStatus::Cancelled;
+            self.consultations.insert(consultation_id, &consultation);
+
+            self.env().emit_event(ConsultationCancelled {
+                consultation_id,
+                cancelled_by: caller,
+                refund_amount,
+            });
+
+            Ok(())
+        }
+
+        /// Report doctor no-show
+        #[ink(message)]
+        pub fn report_no_show(&mut self, consultation_id: u64) -> Result<()> {
+            let caller = self.env().caller();
+            let mut consultation = self.consultations
+                .get(consultation_id)
+                .ok_or(Error::ConsultationNotFound)?;
+
+            // Only patient can report no-show
+            if consultation.patient != caller {
+                return Err(Error::Unauthorized);
+            }
+
+            // Must be past scheduled time
+            let current_time = self.env().block_timestamp();
+            if current_time < consultation.scheduled_time {
+                return Err(Error::TooEarlyToRelease);
+            }
+
+            // Must be in Pending or InProgress status
+            if consultation.status != ConsultationStatus::Pending 
+                && consultation.status != ConsultationStatus::InProgress {
+                return Err(Error::InvalidStatus);
+            }
+
+            // Refund patient
+            if self.env().transfer(consultation.patient, consultation.amount).is_err() {
+                return Err(Error::TransferFailed);
+            }
+
+            consultation.status = ConsultationStatus::NoShow;
+            self.consultations.insert(consultation_id, &consultation);
+
+            self.env().emit_event(NoShowReported {
+                consultation_id,
+                doctor: consultation.doctor,
+            });
+
+            Ok(())
+        }
+
+        /// Book consultation with doctor verification check
+        #[ink(message, payable)]
+        pub fn book_verified_consultation(
+            &mut self,
+            doctor: AccountId,
+            scheduled_time: u64,
+        ) -> Result<u64> {
+            // This would call health_registry contract to verify doctor
+            // For now, we'll add a placeholder that we'll implement with cross-contract calls
+            
+            // TODO: Add cross-contract call to health_registry.is_doctor_verified(doctor)
+            // For MVP, we'll just call the regular book_consultation
+            self.book_consultation(doctor, scheduled_time)
+        }
     }
 
     #[cfg(test)]
@@ -363,14 +512,14 @@ mod consultation_escrow {
         #[ink::test]
         fn new_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
-            let contract = ConsultationEscrow::new(accounts.bob, 3);
+            let contract = ConsultationEscrow::new(accounts.bob, 3, accounts.alice);
             assert_eq!(contract.get_platform_fee_percent(), 3);
         }
 
         #[ink::test]
         fn book_consultation_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
-            let mut contract = ConsultationEscrow::new(accounts.bob, 3);
+            let mut contract = ConsultationEscrow::new(accounts.bob, 3, accounts.alice);
             
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
             
@@ -390,7 +539,7 @@ mod consultation_escrow {
         #[ink::test]
         fn complete_flow_works() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
-            let mut contract = ConsultationEscrow::new(accounts.bob, 3);
+            let mut contract = ConsultationEscrow::new(accounts.bob, 3, accounts.alice);
             
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
             ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1000000000000);
@@ -408,7 +557,7 @@ mod consultation_escrow {
         #[ink::test]
         fn unauthorized_access_fails() {
             let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
-            let mut contract = ConsultationEscrow::new(accounts.bob, 3);
+            let mut contract = ConsultationEscrow::new(accounts.bob, 3, accounts.alice);
             
             ink::env::test::set_caller::<ink::env::DefaultEnvironment>(accounts.alice);
             ink::env::test::set_value_transferred::<ink::env::DefaultEnvironment>(1000000000000);

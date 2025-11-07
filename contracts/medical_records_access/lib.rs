@@ -2,8 +2,8 @@
 
 #[ink::contract]
 mod medical_records_access {
-    use ink::prelude::string::String;
     use ink::storage::Mapping;
+    use ink::prelude::vec::Vec;
 
     #[ink(storage)]
     pub struct MedicalRecordsAccess {
@@ -11,6 +11,7 @@ mod medical_records_access {
         access_grants: Mapping<(Hash, AccountId), AccessGrant>,
         emergency_contacts: Mapping<AccountId, EmergencyContactList>,
         owner: AccountId,
+        access_history: Mapping<Hash, Vec<AccessLog>>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,13 +34,33 @@ mod medical_records_access {
         pub contacts: [Option<AccountId>; 3],
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
+    #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
+    pub struct AccessLog {
+        pub accessor: AccountId,
+        pub access_level: AccessLevel,
+        pub accessed_at: u64,
+        pub action: AccessAction,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[ink::scale_derive(Encode, Decode, TypeInfo)]
+    #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
+    pub enum AccessAction {
+        Granted,
+        Revoked,
+        Viewed,
+        EmergencyAccess,
+    }
+
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
     pub enum AccessLevel {
-        View,           // Can only view
-        ViewAndComment, // Can view and add notes
-        Emergency,      // Emergency contact override
+        View,           
+        ViewAndComment, 
+        Emergency,      
     }
 
     #[ink(event)]
@@ -77,6 +98,13 @@ mod medical_records_access {
         patient: AccountId,
     }
 
+    #[ink(event)]
+    pub struct BulkAccessGranted {
+        #[ink(topic)]
+        granted_to: AccountId,
+        records_count: u32,
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     pub enum Error {
@@ -107,6 +135,7 @@ mod medical_records_access {
                 access_grants: Mapping::default(),
                 emergency_contacts: Mapping::default(),
                 owner: Self::env().caller(),
+                access_history: Mapping::default(),
             }
         }
 
@@ -154,6 +183,7 @@ mod medical_records_access {
             };
 
             self.access_grants.insert((record_hash, granted_to), &grant);
+            self.log_access(record_hash, granted_to, access_level, AccessAction::Granted);
 
             self.env().emit_event(AccessGranted {
                 record_hash,
@@ -162,6 +192,77 @@ mod medical_records_access {
             });
 
             Ok(())
+        }
+
+        #[ink(message)]
+        pub fn grant_access_bulk(
+            &mut self,
+            record_hashes: Vec<Hash>,
+            granted_to: AccountId,
+            access_level: AccessLevel,
+            expires_at: Option<u64>,
+        ) -> Result<()> {
+            let caller = self.env().caller();
+
+            for record_hash in &record_hashes {
+                let owner = self.record_owners.get(*record_hash).ok_or(Error::RecordNotFound)?;
+                if owner != caller {
+                    return Err(Error::Unauthorized);
+                }
+            }
+
+            let granted_at = self.env().block_timestamp();
+            for record_hash in &record_hashes {
+                let grant = AccessGrant {
+                    record_hash: *record_hash,
+                    granted_to,
+                    granted_by: caller,
+                    access_level,
+                    granted_at,
+                    expires_at,
+                    revoked: false,
+                };
+
+                self.access_grants.insert((*record_hash, granted_to), &grant);
+
+                self.log_access(*record_hash, granted_to, access_level, AccessAction::Granted);
+            }
+
+            self.env().emit_event(BulkAccessGranted {
+                granted_to,
+                records_count: u32::try_from(record_hashes.len()).unwrap_or(u32::MAX),
+            });
+
+            Ok(())
+        }
+
+        fn log_access(
+            &mut self,
+            record_hash: Hash,
+            accessor: AccountId,
+            access_level: AccessLevel,
+            action: AccessAction,
+        ) {
+            let log = AccessLog {
+                accessor,
+                access_level,
+                accessed_at: self.env().block_timestamp(),
+                action,
+            };
+
+            let mut history = self.access_history.get(record_hash).unwrap_or_default();
+            history.push(log);
+            
+            if history.len() > 50 {
+                history.remove(0);
+            }
+            
+            self.access_history.insert(record_hash, &history);
+        }
+
+        #[ink(message)]
+        pub fn get_access_history(&self, record_hash: Hash) -> Vec<AccessLog> {
+            self.access_history.get(record_hash).unwrap_or_default()
         }
 
         #[ink(message)]
@@ -183,6 +284,7 @@ mod medical_records_access {
 
             grant.revoked = true;
             self.access_grants.insert((record_hash, revoke_from), &grant);
+            self.log_access(record_hash, revoke_from, grant.access_level, AccessAction::Revoked);
 
             self.env().emit_event(AccessRevoked {
                 record_hash,
@@ -296,7 +398,7 @@ mod medical_records_access {
 
             let current_time = self.env().block_timestamp();
             let expiry = current_time
-                .checked_add(24 * 60 * 60 * 1000) // 24 hours in milliseconds
+                .checked_add(24 * 60 * 60 * 1000)
                 .ok_or(Error::OverflowError)?;
 
             let grant = AccessGrant {
@@ -310,6 +412,7 @@ mod medical_records_access {
             };
 
             self.access_grants.insert((record_hash, caller), &grant);
+            self.log_access(record_hash, caller, AccessLevel::Emergency, AccessAction::EmergencyAccess);
 
             self.env().emit_event(EmergencyAccessUsed {
                 record_hash,
@@ -473,6 +576,53 @@ mod medical_records_access {
             ).unwrap();
             
             assert!(!contract.check_access(record_hash, accounts.bob));
+        }
+
+        #[ink::test]
+        fn bulk_grant_works() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let mut contract = MedicalRecordsAccess::new();
+            
+            let record1 = create_test_hash(1);
+            let record2 = create_test_hash(2);
+            let record3 = create_test_hash(3);
+            
+            contract.register_record(record1).unwrap();
+            contract.register_record(record2).unwrap();
+            contract.register_record(record3).unwrap();
+            
+            let records = ink::prelude::vec![record1, record2, record3];
+            let result = contract.grant_access_bulk(
+                records,
+                accounts.bob,
+                AccessLevel::View,
+                None,
+            );
+            assert!(result.is_ok());
+            
+            assert!(contract.check_access(record1, accounts.bob));
+            assert!(contract.check_access(record2, accounts.bob));
+            assert!(contract.check_access(record3, accounts.bob));
+        }
+
+        #[ink::test]
+        fn access_history_works() {
+            let accounts = ink::env::test::default_accounts::<ink::env::DefaultEnvironment>();
+            let mut contract = MedicalRecordsAccess::new();
+            let record_hash = create_test_hash(1);
+            
+            contract.register_record(record_hash).unwrap();
+            contract.grant_access(
+                record_hash,
+                accounts.bob,
+                AccessLevel::View,
+                None,
+            ).unwrap();
+            
+            let history = contract.get_access_history(record_hash);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].accessor, accounts.bob);
+            assert_eq!(history[0].action, AccessAction::Granted);
         }
     }
 }

@@ -6,20 +6,17 @@ mod health_registry {
     use ink::prelude::vec::Vec;
     use ink::storage::Mapping;
 
-    /// Storage for the HealthRegistry contract
     #[ink(storage)]
     pub struct HealthRegistry {
         owner: AccountId,
         doctors: Mapping<AccountId, DoctorProfile>,
         patients: Mapping<AccountId, PatientProfile>,
         verified_doctors: Mapping<AccountId, bool>,
-        /// Doctor availability schedules
         doctor_availability: Mapping<AccountId, AvailabilitySchedule>,
         total_doctors: u32,
         total_patients: u32,
     }
 
-    /// Doctor profile structure
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
@@ -37,7 +34,6 @@ mod health_registry {
         pub no_show_count: u32,
     }
 
-    /// Patient profile structure
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
@@ -48,17 +44,15 @@ mod health_registry {
         pub created_at: u64,
     }
 
-    /// Time slot structure for availability
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
     pub struct TimeSlot {
-        pub start_time: u64,  // Unix timestamp
-        pub end_time: u64,    // Unix timestamp
+        pub start_time: u64,  
+        pub end_time: u64,    
         pub is_booked: bool,
     }
 
-    /// Availability schedule (max 20 slots per doctor)
     #[derive(Debug, Clone, PartialEq, Eq, Default)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     #[cfg_attr(feature = "std", derive(ink::storage::traits::StorageLayout))]
@@ -66,7 +60,6 @@ mod health_registry {
         pub slots: Vec<TimeSlot>,
     }
 
-    /// Doctor statistics for reputation
     #[derive(Debug, Clone, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     pub struct DoctorStats {
@@ -75,11 +68,10 @@ mod health_registry {
         pub cancelled_consultations: u32,
         pub no_show_count: u32,
         pub rating: u8,
-        pub completion_rate: u8,  // Percentage
+        pub completion_rate: u8,  
         pub verified: bool,
     }
 
-    /// Events
     #[ink(event)]
     pub struct DoctorRegistered {
         #[ink(topic)]
@@ -106,7 +98,6 @@ mod health_registry {
         slots_count: u32,
     }
 
-    /// Errors
     #[derive(Debug, PartialEq, Eq)]
     #[ink::scale_derive(Encode, Decode, TypeInfo)]
     pub enum Error {
@@ -130,7 +121,6 @@ mod health_registry {
     }
 
     impl HealthRegistry {
-        /// Constructor - initializes the contract
         #[ink(constructor)]
         pub fn new() -> Self {
             Self {
@@ -144,7 +134,6 @@ mod health_registry {
             }
         }
 
-        /// Register a new doctor
         #[ink(message)]
         pub fn register_doctor(
             &mut self,
@@ -188,7 +177,6 @@ mod health_registry {
             Ok(())
         }
 
-        /// Register a new patient
         #[ink(message)]
         pub fn register_patient(
             &mut self,
@@ -222,7 +210,6 @@ mod health_registry {
             Ok(())
         }
 
-        /// Verify a doctor (admin only)
         #[ink(message)]
         pub fn verify_doctor(&mut self, doctor: AccountId) -> Result<()> {
             if self.env().caller() != self.owner {
@@ -286,7 +273,6 @@ mod health_registry {
                 .get(doctor)
                 .ok_or(Error::DoctorNotFound)?;
 
-            // Find and mark the slot as booked
             let mut found = false;
             for slot in &mut schedule.slots {
                 if slot.start_time == start_time && !slot.is_booked {
@@ -304,14 +290,12 @@ mod health_registry {
             Ok(())
         }
 
-        /// Mark a time slot as available again (cancellation)
         #[ink(message)]
         pub fn mark_slot_available(&mut self, doctor: AccountId, start_time: u64) -> Result<()> {
             let mut schedule = self.doctor_availability
                 .get(doctor)
                 .ok_or(Error::DoctorNotFound)?;
 
-            // Find and mark the slot as available
             for slot in &mut schedule.slots {
                 if slot.start_time == start_time {
                     slot.is_booked = false;
@@ -323,12 +307,10 @@ mod health_registry {
             Ok(())
         }
 
-        /// Get doctor statistics for reputation
         #[ink(message)]
         pub fn get_doctor_stats(&self, doctor: AccountId) -> Option<DoctorStats> {
             let profile = self.doctors.get(doctor)?;
 
-            // Calculate completion rate
             let completion_rate = if profile.total_consultations > 0 {
                 let rate = profile.completed_consultations
                     .checked_mul(100)
@@ -350,7 +332,6 @@ mod health_registry {
             })
         }
 
-        /// Update consultation stats (called by escrow contract)
         #[ink(message)]
         pub fn increment_completed(&mut self, doctor: AccountId) -> Result<()> {
             let mut profile = self.doctors.get(doctor).ok_or(Error::DoctorNotFound)?;
@@ -367,7 +348,6 @@ mod health_registry {
             Ok(())
         }
 
-        /// Increment cancelled consultations
         #[ink(message)]
         pub fn increment_cancelled(&mut self, doctor: AccountId) -> Result<()> {
             let mut profile = self.doctors.get(doctor).ok_or(Error::DoctorNotFound)?;
@@ -380,7 +360,6 @@ mod health_registry {
             Ok(())
         }
 
-        /// Increment no-show count
         #[ink(message)]
         pub fn increment_no_show(&mut self, doctor: AccountId) -> Result<()> {
             let mut profile = self.doctors.get(doctor).ok_or(Error::DoctorNotFound)?;
@@ -393,48 +372,40 @@ mod health_registry {
             Ok(())
         }
 
-        /// Get doctor profile
         #[ink(message)]
         pub fn get_doctor(&self, doctor: AccountId) -> Option<DoctorProfile> {
             self.doctors.get(doctor)
         }
 
-        /// Get patient profile
         #[ink(message)]
         pub fn get_patient(&self, patient: AccountId) -> Option<PatientProfile> {
             self.patients.get(patient)
         }
 
-        /// Check if doctor is verified (FOR CROSS-CONTRACT CALLS)
         #[ink(message)]
         pub fn is_doctor_verified(&self, doctor: AccountId) -> bool {
             self.verified_doctors.get(doctor).unwrap_or(false)
         }
 
-        /// Get total number of doctors
         #[ink(message)]
         pub fn get_total_doctors(&self) -> u32 {
             self.total_doctors
         }
 
-        /// Get total number of patients
         #[ink(message)]
         pub fn get_total_patients(&self) -> u32 {
             self.total_patients
         }
 
-        /// Get contract owner
         #[ink(message)]
         pub fn get_owner(&self) -> AccountId {
             self.owner
         }
 
-        /// Update doctor rating (called after consultation)
         #[ink(message)]
         pub fn update_doctor_rating(&mut self, doctor: AccountId, new_rating: u8) -> Result<()> {
             let mut profile = self.doctors.get(doctor).ok_or(Error::DoctorNotFound)?;
             
-            // Average the new rating with existing (simple moving average)
             if profile.rating == 0 {
                 profile.rating = new_rating;
             } else {
@@ -452,7 +423,6 @@ mod health_registry {
         }
     }
 
-    /// Unit tests
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -482,7 +452,6 @@ mod health_registry {
         fn set_availability_works() {
             let mut contract = HealthRegistry::new();
             
-            // Register doctor first
             contract.register_doctor(
                 "Dr. Test".to_string(),
                 "Cardiology".to_string(),
